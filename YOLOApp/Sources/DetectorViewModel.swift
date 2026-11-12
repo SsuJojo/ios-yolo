@@ -185,6 +185,15 @@ final class DetectorViewModel: ObservableObject {
             do {
                 let result = try detector.detect(pixelBuffer: pixelBuffer, confidence: confidenceThreshold)
                 detections = result.detections
+                if frame.lidarEnabled {
+                    let depths = frame.depth.map {
+                        LiDARRanging.distances(in: $0, videoSize: size, intrinsics: frame.intrinsics, detections: detections)
+                    }
+                    for index in detections.indices {
+                        let distance = depths?[index] ?? nil
+                        detections[index].distanceReading = distance.map(DistanceReading.meters) ?? .unavailable
+                    }
+                }
                 stats.inferenceMs = result.inferenceMs
                 stats.postprocessMs = result.postprocessMs
                 stats.objectCount = result.detections.count
