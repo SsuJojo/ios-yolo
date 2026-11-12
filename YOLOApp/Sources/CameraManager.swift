@@ -149,18 +149,10 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         rotationObservations = [
             coordinator.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.initial, .new]) { [weak self] _, change in
                 guard let self = self, let angle = change.newValue else { return }
-                if change.isInitial {
-                    // The initial callback runs while `configure()` owns `sessionQueue`.
+                self.sessionQueue.async {
                     self.pendingRotationAngle = angle
                     if let connection = self.output.connection(with: .video) {
                         self.applyRotation(angle, to: connection)
-                    }
-                } else {
-                    self.sessionQueue.async {
-                        self.pendingRotationAngle = angle
-                        if let connection = self.output.connection(with: .video) {
-                            self.applyRotation(angle, to: connection)
-                        }
                     }
                 }
                 DispatchQueue.main.async { self.onRotationChange?(angle) }
