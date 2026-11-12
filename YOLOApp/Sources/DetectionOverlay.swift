@@ -33,9 +33,21 @@ struct DetectionOverlay: View {
 
             for detection in detections {
                 let rect = mapping.rect(detection.rect)
-                let color = Color.forClass(detection.classIndex)
+                let color: Color
+                var label = "\(detection.label) \(Int(detection.confidence * 100))%"
+                switch detection.distanceReading {
+                case .meters(let distance):
+                    // Red at 0.5 m, through yellow to green at 3 m.
+                    let fraction = min(max((distance - 0.5) / 2.5, 0), 1)
+                    color = Color(hue: fraction / 3, saturation: 0.9, brightness: 1)
+                    label += String(format: " · %.2f m", distance)
+                case .unavailable:
+                    color = .gray
+                    label += " · — m"
+                case nil:
+                    color = Color.forClass(detection.classIndex)
+                }
                 context.stroke(Path(roundedRect: rect, cornerRadius: 4), with: .color(color), lineWidth: 2.5)
-                let label = "\(detection.label) \(Int(detection.confidence * 100))%"
                 drawLabel(label, at: CGPoint(x: rect.minX, y: rect.minY), above: true, color: color, in: &context)
             }
 

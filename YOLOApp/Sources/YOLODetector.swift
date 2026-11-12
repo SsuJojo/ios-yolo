@@ -42,12 +42,18 @@ enum ComputeMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum DistanceReading {
+    case unavailable
+    case meters(Double)
+}
+
 struct Detection {
     let classIndex: Int
     let label: String
     let confidence: Float
     /// Normalized to the input image, top-left origin.
     let rect: CGRect
+    var distanceReading: DistanceReading?
 }
 
 struct ModelInfo: Identifiable, Hashable {

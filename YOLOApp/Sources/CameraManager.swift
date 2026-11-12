@@ -17,10 +17,12 @@ struct CameraFrame {
     let intrinsics: CameraIntrinsics
     /// Presentation time, seconds.
     let timestamp: Double
+    let depth: CVPixelBuffer?
+    let lidarEnabled: Bool
 }
 
 /// Back-camera capture delivering portrait 420f (full-range NV12) frames on `videoQueue`.
-final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureDataOutputSynchronizerDelegate {
     let session = AVCaptureSession()
     let videoQueue = DispatchQueue(label: "yolo.camera.video", qos: .userInitiated)
     /// Called on `videoQueue` for every frame that isn't dropped.
@@ -28,6 +30,8 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     private let sessionQueue = DispatchQueue(label: "yolo.camera.session")
     private let output = AVCaptureVideoDataOutput()
+    private let depthOutput = AVCaptureDepthDataOutput()
+    private var synchronizer: AVCaptureDataOutputSynchronizer?
     private var isConfigured = false
     /// Horizontal field of view of the active format in degrees (along the sensor's long side).
     private var fieldOfView: Float = 70
@@ -60,7 +64,19 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     private func configure() -> String? {
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+        let lidar = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back)
+        let formats = lidar?.formats.compactMap { format -> (AVCaptureDevice.Format, AVCaptureDevice.Format)? in
+            let size = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            guard size.width == 1920, size.height == 1080,
+                  CMFormatDescriptionGetMediaSubType(format.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                  let depth = format.supportedDepthDataFormats.first(where: {
+                      CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat16
+                  }) else { return nil }
+            return (format, depth)
+        }
+        let lidarFormats = formats?.first
+        let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        guard let device = lidarFormats == nil ? wide : lidar else {
             return "找不到后置摄像头"
         }
         session.beginConfiguration()
@@ -90,7 +106,23 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 connection.isCameraIntrinsicMatrixDeliveryEnabled = true
             }
         }
-        enableHighFrameRate(device, fps: 60)
+        if let (videoFormat, depthFormat) = lidarFormats, session.canAddOutput(depthOutput) {
+            do {
+                try device.lockForConfiguration()
+                device.activeFormat = videoFormat
+                device.activeDepthDataFormat = depthFormat
+                device.unlockForConfiguration()
+            } catch {
+                return "无法配置 LiDAR：\(error.localizedDescription)"
+            }
+            depthOutput.isFilteringEnabled = false
+            session.addOutput(depthOutput)
+            let sync = AVCaptureDataOutputSynchronizer(dataOutputs: [output, depthOutput])
+            sync.setDelegate(self, queue: videoQueue)
+            synchronizer = sync
+        } else {
+            enableHighFrameRate(device, fps: 60)
+        }
         fieldOfView = device.activeFormat.videoFieldOfView
         return nil
     }
@@ -111,6 +143,21 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        deliver(sampleBuffer, depth: nil, lidarEnabled: false)
+    }
+
+    func dataOutputSynchronizer(
+        _ synchronizer: AVCaptureDataOutputSynchronizer,
+        didOutput data: AVCaptureSynchronizedDataCollection
+    ) {
+        guard let video = data.synchronizedData(for: output) as? AVCaptureSynchronizedSampleBufferData,
+              !video.sampleBufferWasDropped else { return }
+        let depth = data.synchronizedData(for: depthOutput) as? AVCaptureSynchronizedDepthData
+        let map = depth.flatMap { $0.depthDataWasDropped ? nil : $0.depthData.depthDataMap }
+        deliver(video.sampleBuffer, depth: map, lidarEnabled: true)
+    }
+
+    private func deliver(_ sampleBuffer: CMSampleBuffer, depth: CVPixelBuffer?, lidarEnabled: Bool) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let width = Double(CVPixelBufferGetWidth(pixelBuffer))
         let height = Double(CVPixelBufferGetHeight(pixelBuffer))
@@ -118,7 +165,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let intrinsics = matrix.flatMap { parseIntrinsics($0, width: width, height: height) }
             ?? estimatedIntrinsics(width: width, height: height)
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-        onFrame?(CameraFrame(pixelBuffer: pixelBuffer, intrinsics: intrinsics, timestamp: timestamp))
+        onFrame?(CameraFrame(pixelBuffer: pixelBuffer, intrinsics: intrinsics, timestamp: timestamp, depth: depth, lidarEnabled: lidarEnabled))
     }
 
     private func parseIntrinsics(_ data: Data, width: Double, height: Double) -> CameraIntrinsics? {

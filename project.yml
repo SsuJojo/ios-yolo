@@ -37,7 +37,7 @@ targets:
     info:
       path: YOLOApp/Info.plist
       properties:
-        CFBundleDisplayName: YOLO26
+        CFBundleDisplayName: YOLO26 LiDAR
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSRequiresIPhoneOS: true
