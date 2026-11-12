@@ -2,7 +2,7 @@ import AVFoundation
 import CoreVideo
 import simd
 
-/// Pinhole intrinsics in pixels of the delivered (portrait) frame.
+/// Pinhole intrinsics in pixels of the delivered (already rotated) frame.
 struct CameraIntrinsics {
     var fx: Double
     var fy: Double
@@ -19,9 +19,11 @@ struct CameraFrame {
     let timestamp: Double
     let depth: CVPixelBuffer?
     let lidarEnabled: Bool
+    /// Clockwise rotation, in degrees, applied to the delivered video buffer.
+    let rotationAngle: CGFloat
 }
 
-/// Back-camera capture delivering portrait 420f (full-range NV12) frames on `videoQueue`.
+/// Back-camera capture delivering upright 420f (full-range NV12) frames on `videoQueue`.
 final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureDataOutputSynchronizerDelegate {
     let session = AVCaptureSession()
     let videoQueue = DispatchQueue(label: "yolo.camera.video", qos: .userInitiated)
@@ -35,6 +37,13 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var isConfigured = false
     /// Horizontal field of view of the active format in degrees (along the sensor's long side).
     private var fieldOfView: Float = 70
+    /// Applied to the video connection before the first frame; updated by the rotation coordinator afterwards.
+    private var pendingRotationAngle: CGFloat = 90
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var rotationObservations: [NSKeyValueObservation] = []
+
+    /// Called on the main queue when the device's upright rotation angle changes.
+    var onRotationChange: ((CGFloat) -> Void)?
 
     /// Requests permission, configures the session and starts it. `completion` runs on the main queue.
     func start(completion: @escaping (String?) -> Void) {
@@ -99,9 +108,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         session.addOutput(output)
 
         if let connection = output.connection(with: .video) {
-            if connection.isVideoRotationAngleSupported(90) {
-                connection.videoRotationAngle = 90 // portrait buffers
-            }
+            applyRotation(pendingRotationAngle, to: connection)
             if connection.isCameraIntrinsicMatrixDeliverySupported {
                 connection.isCameraIntrinsicMatrixDeliveryEnabled = true
             }
@@ -124,7 +131,41 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             enableHighFrameRate(device, fps: 60)
         }
         fieldOfView = device.activeFormat.videoFieldOfView
+        observeRotation(of: device)
         return nil
+    }
+
+    private func applyRotation(_ angle: CGFloat, to connection: AVCaptureConnection) {
+        guard connection.isVideoRotationAngleSupported(angle), connection.videoRotationAngle != angle else { return }
+        connection.videoRotationAngle = angle
+    }
+
+    /// Watches the physical device so iPad landscape (including 180° flips) and portrait keep the
+    /// video buffers, preview and overlay in the same orientation.
+    private func observeRotation(of device: AVCaptureDevice) {
+        guard rotationCoordinator == nil else { return }
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+        rotationCoordinator = coordinator
+        rotationObservations = [
+            coordinator.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.initial, .new]) { [weak self] _, change in
+                guard let self = self, let angle = change.newValue else { return }
+                if change.isInitial {
+                    // The initial callback runs while `configure()` owns `sessionQueue`.
+                    self.pendingRotationAngle = angle
+                    if let connection = self.output.connection(with: .video) {
+                        self.applyRotation(angle, to: connection)
+                    }
+                } else {
+                    self.sessionQueue.async {
+                        self.pendingRotationAngle = angle
+                        if let connection = self.output.connection(with: .video) {
+                            self.applyRotation(angle, to: connection)
+                        }
+                    }
+                }
+                DispatchQueue.main.async { self.onRotationChange?(angle) }
+            },
+        ]
     }
 
     /// Picks a 1080p format that supports `fps` so the camera doesn't cap the measured FPS at 30.
@@ -161,21 +202,42 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let width = Double(CVPixelBufferGetWidth(pixelBuffer))
         let height = Double(CVPixelBufferGetHeight(pixelBuffer))
+        let rotation = output.connection(with: .video)?.videoRotationAngle ?? 90
         let matrix = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) as? Data
-        let intrinsics = matrix.flatMap { parseIntrinsics($0, width: width, height: height) }
+        let intrinsics = matrix.flatMap { parseIntrinsics($0, width: width, height: height, rotation: rotation) }
             ?? estimatedIntrinsics(width: width, height: height)
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-        onFrame?(CameraFrame(pixelBuffer: pixelBuffer, intrinsics: intrinsics, timestamp: timestamp, depth: depth, lidarEnabled: lidarEnabled))
+        onFrame?(CameraFrame(
+            pixelBuffer: pixelBuffer,
+            intrinsics: intrinsics,
+            timestamp: timestamp,
+            depth: depth,
+            lidarEnabled: lidarEnabled,
+            rotationAngle: rotation
+        ))
     }
 
-    private func parseIntrinsics(_ data: Data, width: Double, height: Double) -> CameraIntrinsics? {
+    private func parseIntrinsics(_ data: Data, width: Double, height: Double, rotation: CGFloat) -> CameraIntrinsics? {
         guard data.count >= MemoryLayout<matrix_float3x3>.size else { return nil }
         let m = data.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) }
         var fx = Double(m.columns.0.x), fy = Double(m.columns.1.y)
         var cx = Double(m.columns.2.x), cy = Double(m.columns.2.y)
-        // The matrix may describe the unrotated landscape sensor; rotate it 90° clockwise like the frame.
+        // Usually the matrix describes the unrotated landscape sensor; rotate it like the delivered
+        // frame. If the matrix already matches the frame's aspect, leave it alone.
+        let rotated = Int(rotation.rounded()) % 360
+        let sensorWidth = (rotated == 90 || rotated == 270) ? height : width
+        let sensorHeight = (rotated == 90 || rotated == 270) ? width : height
         if (cx > cy) != (width > height) {
-            (fx, fy, cx, cy) = (fy, fx, width - cy, cx)
+            switch rotated {
+            case 90:
+                (fx, fy, cx, cy) = (fy, fx, width - cy, cx)
+            case 180:
+                (cx, cy) = (sensorWidth - cx, sensorHeight - cy)
+            case 270:
+                (fx, fy, cx, cy) = (fy, fx, cy, sensorWidth - cx)
+            default:
+                break
+            }
         }
         let plausible = fx > 0 && fy > 0 && abs(cx - width / 2) < width * 0.2 && abs(cy - height / 2) < height * 0.2
         return plausible ? CameraIntrinsics(fx: fx, fy: fy, cx: cx, cy: cy, isFromCamera: true) : nil

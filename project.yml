@@ -29,7 +29,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.github.iosyolo.app
         PRODUCT_NAME: YOLOApp
-        TARGETED_DEVICE_FAMILY: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
         ENABLE_PREVIEWS: YES
         SWIFT_OBJC_BRIDGING_HEADER: YOLOApp/Sources/YOLOApp-Bridging-Header.h
@@ -43,12 +43,17 @@ targets:
         LSRequiresIPhoneOS: true
         NSCameraUsageDescription: 需要使用相机进行实时目标检测
         UILaunchScreen: {}
-        UIRequiresFullScreen: true
+        UIRequiresFullScreen: false
         UIStatusBarHidden: true
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        "UISupportedInterfaceOrientations~ipad":
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         UIRequiredDeviceCapabilities:
           - arm64
     scheme: {}

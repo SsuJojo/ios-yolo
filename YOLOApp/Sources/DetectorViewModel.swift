@@ -96,6 +96,7 @@ final class DetectorViewModel: ObservableObject {
     @Published private(set) var detections: [Detection] = []
     @Published private(set) var tags: [TagOverlay] = []
     @Published private(set) var imageSize = CGSize(width: 1080, height: 1920)
+    @Published private(set) var videoRotationAngle: CGFloat = 90
     @Published private(set) var stats = FrameStats()
     @Published private(set) var isLoading = false
     @Published private(set) var statusMessage: String?
@@ -123,6 +124,9 @@ final class DetectorViewModel: ObservableObject {
     init() {
         selectedModel = models.first
         camera.onFrame = { [weak self] frame in self?.process(frame) }
+        camera.onRotationChange = { [weak self] angle in
+            if let self, self.videoRotationAngle != angle { self.videoRotationAngle = angle }
+        }
     }
 
     func start() {
@@ -187,7 +191,13 @@ final class DetectorViewModel: ObservableObject {
                 detections = result.detections
                 if frame.lidarEnabled {
                     let depths = frame.depth.map {
-                        LiDARRanging.distances(in: $0, videoSize: size, intrinsics: frame.intrinsics, detections: detections)
+                        LiDARRanging.distances(
+                            in: $0,
+                            videoSize: size,
+                            rotationAngle: frame.rotationAngle,
+                            intrinsics: frame.intrinsics,
+                            detections: detections
+                        )
                     }
                     for index in detections.indices {
                         let distance = depths?[index] ?? nil
