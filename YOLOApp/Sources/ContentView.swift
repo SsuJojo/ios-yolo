@@ -1,4 +1,5 @@
 import SwiftUI
+import simd
 import UIKit
 
 struct ContentView: View {
@@ -10,12 +11,19 @@ struct ContentView: View {
         GeometryReader { proxy in
             ZStack {
                 Color.black.ignoresSafeArea()
-                CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
-                    .ignoresSafeArea()
                 if viewModel.detectionMode == .lidar {
-                    LiDAROverlay(gridVisible: viewModel.lidarGridVisible)
+                    if viewModel.meshActive {
+                        ARMeshView(controller: viewModel.mesh)
+                            .ignoresSafeArea()
+                    } else {
+                        CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
+                            .ignoresSafeArea()
+                    }
+                    LiDAROverlay()
                         .ignoresSafeArea()
                 } else {
+                    CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
+                        .ignoresSafeArea()
                     DetectionOverlay(detections: viewModel.detections, tags: viewModel.tags, imageSize: viewModel.imageSize)
                         .ignoresSafeArea()
                 }
@@ -96,9 +104,13 @@ struct ContentView: View {
                 }
             }
             if viewModel.detectionMode == .lidar {
-                Text(viewModel.lidarAvailable ? "LiDAR 深度有效 · 准星实时测距" : "未检测到 LiDAR，需要 iPhone/iPad Pro")
+                Text(viewModel.meshActive
+                     ? String(format: "空间网格运行中 · %d 锚点 · LiDAR 场景重建", viewModel.meshAnchors)
+                     : (viewModel.lidarAvailable || ARMeshController.isSupported
+                        ? "LiDAR 深度有效 · 准星实时测距"
+                        : "未检测到 LiDAR，需要 iPhone/iPad Pro"))
                     .font(.caption)
-                    .foregroundColor(viewModel.lidarAvailable ? .mint : .orange)
+                    .foregroundColor(viewModel.lidarAvailable || viewModel.meshActive ? .mint : .orange)
             }
             if viewModel.detectionMode.runsAprilTag {
                 HStack(spacing: 12) {
@@ -253,11 +265,15 @@ struct ContentView: View {
                 Text("— m")
                     .font(.system(size: 34, weight: .semibold, design: .rounded))
                     .foregroundColor(.secondary)
-                Text(viewModel.lidarAvailable ? "准星处无有效深度" : "设备无 LiDAR")
+                Text(viewModel.lidarAvailable ? "准星处无有效深度" : (viewModel.meshActive ? "等待 ARKit 初始化…" : "设备无 LiDAR"))
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
             Spacer()
+        }
+
+        if viewModel.meshActive {
+            MeshStatusControls(mesh: viewModel.mesh)
         }
 
         HStack(spacing: 8) {
@@ -271,13 +287,7 @@ struct ContentView: View {
             .tint(.mint)
             .disabled(viewModel.lidarProbe == nil)
 
-            Button {
-                viewModel.lidarGridVisible.toggle()
-            } label: {
-                Text(viewModel.lidarGridVisible ? "网格：开" : "网格：关")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
+            MeshToggleButton(mesh: viewModel.mesh, enabled: viewModel.meshActive)
 
             Button(role: .destructive) {
                 viewModel.clearPinnedPoints()
@@ -289,11 +299,30 @@ struct ContentView: View {
             .disabled(viewModel.pinnedPoints.isEmpty)
         }
 
+        if viewModel.meshActive {
+            Button(role: .destructive) {
+                viewModel.clearSpatialMesh()
+            } label: {
+                Label("重置扫描", systemImage: "arrow.counterclockwise")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+        }
+
         if !viewModel.pinnedPoints.isEmpty {
             VStack(alignment: .leading, spacing: 3) {
                 ForEach(Array(viewModel.pinnedPoints.enumerated()), id: \.element.id) { index, point in
                     let probe = point.probe
-                    let span = index == 0 ? "" : String(format: "   距上一点 %.2f m", probe.distance(to: viewModel.pinnedPoints[index - 1].probe))
+                    var span = ""
+                    if index > 0 {
+                        let previous = viewModel.pinnedPoints[index - 1]
+                        if let a = point.worldPosition, let b = previous.worldPosition {
+                            let d = simd_distance(a, b)
+                            span = String(format: "   距上一点 %.2f m（世界）", d)
+                        } else {
+                            span = String(format: "   距上一点 %.2f m", probe.distance(to: previous.probe))
+                        }
+                    }
                     Text(String(format: "#%d  %.2f m   X %+.2f  Y %+.2f  Z %+.2f%@", index + 1, probe.range, probe.x, probe.y, probe.z, span))
                         .font(.caption2.monospacedDigit())
                 }
@@ -301,8 +330,47 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
 
-        Text("单位：米 · 坐标原点为镜头中心 · X→右 Y→上 Z→镜头正前方 · 取点坐标相对取点时刻的相机位置，设备移动后不跟随")
+        Text(viewModel.meshActive
+             ? "单位：米 · 空间网格世界锚定，移动视角不消失 · 固定点同样锚定在房间中"
+             : "单位：米 · 坐标原点为镜头中心 · X→右 Y→上 Z→镜头正前方 · 取点坐标相对取点时刻的相机位置，设备移动后不跟随")
             .font(.caption2)
             .foregroundColor(.secondary)
+    }
+}
+
+/// Density slider + stats line; observes the mesh controller directly.
+private struct MeshStatusControls: View {
+    @ObservedObject var mesh: ARMeshController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("网格密度").font(.caption)
+                Slider(value: $mesh.meshDensity, in: 10...100, step: 10)
+                Text("\(Int(mesh.meshDensity))%")
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 36)
+            }
+            Text(String(format: "空间网格 · %d 个锚点 · %dk 三角形", mesh.anchorCount, mesh.triangleCount / 1000))
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+/// Grid on/off button; observes the mesh controller directly.
+private struct MeshToggleButton: View {
+    @ObservedObject var mesh: ARMeshController
+    let enabled: Bool
+
+    var body: some View {
+        Button {
+            mesh.meshVisible.toggle()
+        } label: {
+            Text(mesh.meshVisible ? "网格：开" : "网格：关")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!enabled)
     }
 }

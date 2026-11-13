@@ -1,23 +1,11 @@
 import SwiftUI
 
-/// Crosshair and optional rule-of-thirds grid drawn over the camera preview in LiDAR mode.
+/// Crosshair drawn over the spatial mesh / camera preview in LiDAR mode.
+/// The world-anchored white grid itself is rendered by `ARMeshController`.
 struct LiDAROverlay: View {
-    let gridVisible: Bool
-
     var body: some View {
         Canvas { context, size in
             let center = CGPoint(x: size.width / 2, y: size.height / 2)
-
-            if gridVisible {
-                var grid = Path()
-                for fraction in [1.0 / 3, 2.0 / 3] {
-                    grid.move(to: CGPoint(x: size.width * fraction, y: 0))
-                    grid.addLine(to: CGPoint(x: size.width * fraction, y: size.height))
-                    grid.move(to: CGPoint(x: 0, y: size.height * fraction))
-                    grid.addLine(to: CGPoint(x: size.width, y: size.height * fraction))
-                }
-                context.stroke(grid, with: .color(.white.opacity(0.35)), lineWidth: 0.5)
-            }
 
             let arm: CGFloat = 28
             let gap: CGFloat = 10
