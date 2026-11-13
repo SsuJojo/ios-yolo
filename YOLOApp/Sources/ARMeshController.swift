@@ -1,6 +1,7 @@
 import ARKit
 import Combine
 import SceneKit
+import SwiftUI
 import UIKit
 
 /// World-anchored spatial mesh from ARKit Scene Reconstruction.
@@ -56,12 +57,14 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
             let geometry = mesh.geometry
             let vertices = geometry.vertices
             let faces = geometry.faces
-            guard vertices.count > 0, faces.primitiveCount > 0 else { return nil }
+            // iOS 26 SDK renamed `primitiveCount` to `count` on ARGeometryElement.
+            let faceTotal = faces.count
+            guard vertices.count > 0, faceTotal > 0 else { return nil }
             vertexData = Data(bytes: vertices.buffer.contents(), count: vertices.buffer.length)
             vertexStride = vertices.stride
             indexData = Data(bytes: faces.buffer.contents(), count: faces.buffer.length)
             bytesPerIndex = faces.bytesPerIndex
-            faceCount = faces.primitiveCount
+            faceCount = faceTotal
         }
 
         var vertexCount: Int { vertexStride > 0 ? vertexData.count / vertexStride : 0 }
@@ -77,7 +80,7 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
     func run() {
         guard Self.isSupported else { return }
         let configuration = ARWorldTrackingConfiguration()
-        configuration.sceneReconstruction = .enabled
+        configuration.sceneReconstruction = .mesh
         configuration.environmentTexturing = .none
         configuration.frameSemantics = [.sceneDepth]
         arAvailable = true
@@ -242,7 +245,7 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
             data: snapshot.vertexData,
             semantic: .vertex,
             vectorCount: vertexCount,
-            floatComponents: true,
+            usesFloatComponents: true,
             componentsPerVector: 3,
             bytesPerComponent: MemoryLayout<Float>.size,
             dataOffset: 0,
@@ -283,9 +286,12 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
         }
         guard !lines.isEmpty else { return nil }
 
+        let lineCount = lines.count
         let element = SCNGeometryElement(
-            data: Data(bytes: lines, length: lines.count * MemoryLayout<Int32>.stride),
-            primitiveType: .line
+            data: Data(bytes: lines, count: lineCount * MemoryLayout<Int32>.stride),
+            primitiveType: .line,
+            primitiveCount: lineCount / 2,
+            bytesPerIndex: MemoryLayout<Int32>.stride
         )
         let wire = SCNGeometry(sources: [source], elements: [element])
         wire.firstMaterial = Self.wireMaterial

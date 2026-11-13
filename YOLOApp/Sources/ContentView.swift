@@ -12,13 +12,14 @@ struct ContentView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 if viewModel.detectionMode == .lidar {
-                    if viewModel.meshActive {
-                        ARMeshView(controller: viewModel.mesh)
-                            .ignoresSafeArea()
-                    } else {
-                        CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
-                            .ignoresSafeArea()
+                    Group {
+                        if viewModel.meshActive {
+                            ARMeshView(controller: viewModel.mesh)
+                        } else {
+                            CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
+                        }
                     }
+                    .ignoresSafeArea()
                     LiDAROverlay()
                         .ignoresSafeArea()
                 } else {
@@ -313,17 +314,15 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 ForEach(Array(viewModel.pinnedPoints.enumerated()), id: \.element.id) { index, point in
                     let probe = point.probe
-                    var span = ""
-                    if index > 0 {
+                    let spanText: String = {
+                        guard index > 0 else { return "" }
                         let previous = viewModel.pinnedPoints[index - 1]
                         if let a = point.worldPosition, let b = previous.worldPosition {
-                            let d = simd_distance(a, b)
-                            span = String(format: "   距上一点 %.2f m（世界）", d)
-                        } else {
-                            span = String(format: "   距上一点 %.2f m", probe.distance(to: previous.probe))
+                            return String(format: "   距上一点 %.2f m（世界）", simd_distance(a, b))
                         }
-                    }
-                    Text(String(format: "#%d  %.2f m   X %+.2f  Y %+.2f  Z %+.2f%@", index + 1, probe.range, probe.x, probe.y, probe.z, span))
+                        return String(format: "   距上一点 %.2f m", probe.distance(to: previous.probe))
+                    }()
+                    Text(String(format: "#%d  %.2f m   X %+.2f  Y %+.2f  Z %+.2f%@", index + 1, probe.range, probe.x, probe.y, probe.z, spanText))
                         .font(.caption2.monospacedDigit())
                 }
             }
