@@ -12,8 +12,13 @@ struct ContentView: View {
                 Color.black.ignoresSafeArea()
                 CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
                     .ignoresSafeArea()
-                DetectionOverlay(detections: viewModel.detections, tags: viewModel.tags, imageSize: viewModel.imageSize)
-                    .ignoresSafeArea()
+                if viewModel.detectionMode == .lidar {
+                    LiDAROverlay(gridVisible: viewModel.lidarGridVisible)
+                        .ignoresSafeArea()
+                } else {
+                    DetectionOverlay(detections: viewModel.detections, tags: viewModel.tags, imageSize: viewModel.imageSize)
+                        .ignoresSafeArea()
+                }
 
                 if usesSidePanel(for: proxy.size) {
                     sidePanelLayout(in: proxy.size)
@@ -90,6 +95,11 @@ struct ContentView: View {
                     metric("目标", "\(viewModel.stats.objectCount)")
                 }
             }
+            if viewModel.detectionMode == .lidar {
+                Text(viewModel.lidarAvailable ? "LiDAR 深度有效 · 准星实时测距" : "未检测到 LiDAR，需要 iPhone/iPad Pro")
+                    .font(.caption)
+                    .foregroundColor(viewModel.lidarAvailable ? .mint : .orange)
+            }
             if viewModel.detectionMode.runsAprilTag {
                 HStack(spacing: 12) {
                     metric("AprilTag", String(format: "%.1f ms", viewModel.stats.tagMs))
@@ -131,37 +141,42 @@ struct ContentView: View {
             if viewModel.detectionMode.runsAprilTag {
                 aprilTagControls
             }
+            if viewModel.detectionMode == .lidar {
+                lidarControls
+            }
 
-            HStack {
-                Menu {
-                    ForEach(ModelGroup.groups(of: viewModel.models)) { group in
-                        Section(group.title) {
-                            ForEach(group.models) { model in
-                                Button {
-                                    viewModel.selectedModel = model
-                                } label: {
-                                    if model == viewModel.selectedModel {
-                                        Label(model.menuTitle, systemImage: "checkmark")
-                                    } else {
-                                        Text(model.menuTitle)
+            if viewModel.detectionMode != .lidar {
+                HStack {
+                    Menu {
+                        ForEach(ModelGroup.groups(of: viewModel.models)) { group in
+                            Section(group.title) {
+                                ForEach(group.models) { model in
+                                    Button {
+                                        viewModel.selectedModel = model
+                                    } label: {
+                                        if model == viewModel.selectedModel {
+                                            Label(model.menuTitle, systemImage: "checkmark")
+                                        } else {
+                                            Text(model.menuTitle)
+                                        }
                                     }
                                 }
                             }
                         }
+                    } label: {
+                        Label(viewModel.selectedModel?.name ?? "选择模型", systemImage: "cube.box")
+                            .frame(maxWidth: .infinity)
                     }
-                } label: {
-                    Label(viewModel.selectedModel?.name ?? "选择模型", systemImage: "cube.box")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
+                    .buttonStyle(.bordered)
 
-                Button {
-                    showBenchmark = true
-                } label: {
-                    Label("跑分对比", systemImage: "speedometer")
-                        .frame(maxWidth: .infinity)
+                    Button {
+                        showBenchmark = true
+                    } label: {
+                        Label("跑分对比", systemImage: "speedometer")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
         }
         .disabled(viewModel.isLoading || viewModel.isBenchmarking)
@@ -217,6 +232,76 @@ struct ContentView: View {
         }
 
         Text("tag36h11 · 原点=Tag 左上角 · X→右 Y→上 Z→垂直指出 Tag · 坐标为相机系 (cm)")
+            .font(.caption2)
+            .foregroundColor(.secondary)
+    }
+
+    @ViewBuilder
+    private var lidarControls: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            if let probe = viewModel.lidarProbe {
+                Text(String(format: "%.2f m", probe.range))
+                    .font(.system(size: 34, weight: .semibold, design: .rounded).monospacedDigit())
+                    .foregroundColor(.mint)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(String(format: "X %+.2f   Y %+.2f", probe.x, probe.y))
+                    Text(String(format: "Z %+.2f", probe.z))
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+            } else {
+                Text("— m")
+                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                    .foregroundColor(.secondary)
+                Text(viewModel.lidarAvailable ? "准星处无有效深度" : "设备无 LiDAR")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+
+        HStack(spacing: 8) {
+            Button {
+                viewModel.pinLiDARPoint()
+            } label: {
+                Label("固定取点", systemImage: "mappin")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.mint)
+            .disabled(viewModel.lidarProbe == nil)
+
+            Button {
+                viewModel.lidarGridVisible.toggle()
+            } label: {
+                Text(viewModel.lidarGridVisible ? "网格：开" : "网格：关")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+
+            Button(role: .destructive) {
+                viewModel.clearPinnedPoints()
+            } label: {
+                Text("清除点")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(viewModel.pinnedPoints.isEmpty)
+        }
+
+        if !viewModel.pinnedPoints.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(viewModel.pinnedPoints.enumerated()), id: \.element.id) { index, point in
+                    let probe = point.probe
+                    let span = index == 0 ? "" : String(format: "   距上一点 %.2f m", probe.distance(to: viewModel.pinnedPoints[index - 1].probe))
+                    Text(String(format: "#%d  %.2f m   X %+.2f  Y %+.2f  Z %+.2f%@", index + 1, probe.range, probe.x, probe.y, probe.z, span))
+                        .font(.caption2.monospacedDigit())
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        Text("单位：米 · 坐标原点为镜头中心 · X→右 Y→上 Z→镜头正前方 · 取点坐标相对取点时刻的相机位置，设备移动后不跟随")
             .font(.caption2)
             .foregroundColor(.secondary)
     }

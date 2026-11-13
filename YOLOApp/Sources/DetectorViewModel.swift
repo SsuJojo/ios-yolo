@@ -18,6 +18,7 @@ enum DetectionMode: String, CaseIterable, Identifiable {
     case yolo
     case aprilTag
     case both
+    case lidar
 
     var id: String { rawValue }
 
@@ -26,11 +27,20 @@ enum DetectionMode: String, CaseIterable, Identifiable {
         case .yolo: return "YOLO"
         case .aprilTag: return "AprilTag"
         case .both: return "同时"
+        case .lidar: return "LiDAR"
         }
     }
 
-    var runsYOLO: Bool { self != .aprilTag }
-    var runsAprilTag: Bool { self != .yolo }
+    var runsYOLO: Bool { self != .aprilTag && self != .lidar }
+    var runsAprilTag: Bool { self == .aprilTag || self == .both }
+    var runsLiDAR: Bool { self == .lidar }
+}
+
+/// A crosshair reading frozen by the user. Coordinates are relative to the camera at the moment it was pinned.
+struct PinnedPoint: Identifiable, Equatable {
+    let id = UUID()
+    let probe: LiDARProbe
+    let time: Date
 }
 
 struct BenchmarkResult: Identifiable {
@@ -93,6 +103,13 @@ final class DetectorViewModel: ObservableObject {
         }
     }
 
+    /// Live crosshair reading in LiDAR mode; nil when depth is unavailable.
+    @Published private(set) var lidarProbe: LiDARProbe?
+    /// True when the capture device is delivering a LiDAR depth map.
+    @Published private(set) var lidarAvailable = false
+    @Published var lidarGridVisible = true
+    @Published private(set) var pinnedPoints: [PinnedPoint] = []
+
     @Published private(set) var detections: [Detection] = []
     @Published private(set) var tags: [TagOverlay] = []
     @Published private(set) var imageSize = CGSize(width: 1080, height: 1920)
@@ -108,6 +125,16 @@ final class DetectorViewModel: ObservableObject {
     private let loadQueue = DispatchQueue(label: "yolo.model.load", qos: .userInitiated)
     private var loadGeneration = 0
     private var hasStarted = false
+
+    /// Freezes the current crosshair reading. Coordinates are relative to the camera position at this moment.
+    func pinLiDARPoint() {
+        guard let probe = lidarProbe else { return }
+        pinnedPoints.append(PinnedPoint(probe: probe, time: Date()))
+    }
+
+    func clearPinnedPoints() {
+        pinnedPoints.removeAll()
+    }
 
     // Confined to camera.videoQueue.
     private var detector: YOLODetector?
@@ -183,6 +210,7 @@ final class DetectorViewModel: ObservableObject {
         var stats = FrameStats()
         var detections: [Detection] = []
         var tags: [TagOverlay] = []
+        var probe: LiDARProbe?
         var failure: String?
 
         if activeMode.runsYOLO, let detector {
@@ -212,6 +240,15 @@ final class DetectorViewModel: ObservableObject {
             }
         }
 
+        if activeMode.runsLiDAR, let depth = frame.depth {
+            probe = LiDARRanging.probe(
+                in: depth,
+                videoSize: size,
+                rotationAngle: frame.rotationAngle,
+                intrinsics: frame.intrinsics
+            )
+        }
+
         if activeMode.runsAprilTag {
             let start = CACurrentMediaTime()
             let found = tagDetector.detect(pixelBuffer: pixelBuffer, intrinsics: frame.intrinsics, tagSize: activeTagSize)
@@ -236,9 +273,12 @@ final class DetectorViewModel: ObservableObject {
         lastFrameTime = now
         stats.fps = smoothedFPS
 
+        let lidarEnabled = frame.lidarEnabled
         DispatchQueue.main.async {
             self.detections = detections
             self.tags = tags
+            self.lidarProbe = probe
+            self.lidarAvailable = lidarEnabled
             self.imageSize = size
             self.stats = stats
             if let failure { self.errorMessage = failure }
