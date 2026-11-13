@@ -64,9 +64,13 @@ enum LiDARRanging {
             }
         }
         guard samples.count >= 9 else { return nil }
-        // Same estimator as before: median of the line-of-sight ranges.
-        let ranged = samples.map { (sample: $0, range: $0.z * (1 + $0.rx * $0.rx + $0.ry * $0.ry).squareRoot()) }
-            .sorted { $0.range < $1.range }
+        // Break up the chain to help the Swift type-checker.
+        typealias Ranked = (sample: (z: Double, rx: Double, ry: Double), range: Double)
+        var ranged: [Ranked] = samples.map { s in
+            let los: Double = s.z * (1.0 + s.rx * s.rx + s.ry * s.ry).squareRoot()
+            return (sample: s, range: los)
+        }
+        ranged.sort { $0.range < $1.range }
         let m = ranged[ranged.count / 2]
         return LiDARProbe(
             range: m.range,
