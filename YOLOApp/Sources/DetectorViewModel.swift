@@ -3,6 +3,7 @@ import CoreGraphics
 import CoreVideo
 import Foundation
 import QuartzCore
+import simd
 
 struct FrameStats {
     var fps: Double = 0
@@ -18,6 +19,7 @@ enum DetectionMode: String, CaseIterable, Identifiable {
     case yolo
     case aprilTag
     case both
+    case lidar
 
     var id: String { rawValue }
 
@@ -26,11 +28,26 @@ enum DetectionMode: String, CaseIterable, Identifiable {
         case .yolo: return "YOLO"
         case .aprilTag: return "AprilTag"
         case .both: return "同时"
+        case .lidar: return "LiDAR"
         }
     }
 
-    var runsYOLO: Bool { self != .aprilTag }
-    var runsAprilTag: Bool { self != .yolo }
+    var runsYOLO: Bool { self != .aprilTag && self != .lidar }
+    var runsAprilTag: Bool { self == .aprilTag || self == .both }
+    var runsLiDAR: Bool { self == .lidar }
+}
+
+/// A crosshair reading frozen by the user. Camera coordinates were captured at pin time;
+/// `worldPosition` (when ARKit tracking is available) is anchored in the room and stays put
+/// as the device moves.
+struct PinnedPoint: Identifiable, Equatable {
+    let id = UUID()
+    let probe: LiDARProbe
+    /// World-space position from ARKit at pin time; nil when using AVCapture-only ranging.
+    var worldPosition: simd_float3?
+    let time: Date
+
+    static func == (lhs: PinnedPoint, rhs: PinnedPoint) -> Bool { lhs.id == rhs.id }
 }
 
 struct BenchmarkResult: Identifiable {
@@ -67,6 +84,7 @@ final class DetectorViewModel: ObservableObject {
                 self.activeMode = mode
                 if !mode.runsAprilTag { self.tagTracker.reset() }
             }
+            DispatchQueue.main.async { self.updateMeshSession(for: mode) }
         }
     }
     /// Edge length of the tag's outer black square, in centimeters.
@@ -93,9 +111,23 @@ final class DetectorViewModel: ObservableObject {
         }
     }
 
+    /// Live crosshair reading in LiDAR mode; nil when depth is unavailable.
+    @Published private(set) var lidarProbe: LiDARProbe?
+    /// True when the capture device is delivering a LiDAR depth map.
+    @Published private(set) var lidarAvailable = false
+    @Published private(set) var pinnedPoints: [PinnedPoint] = []
+
+    // Spatial-mesh (ARKit scene reconstruction) state.
+    let mesh = ARMeshController()
+    /// True while the LiDAR mode runs its world-anchored spatial mesh scan.
+    @Published private(set) var meshActive = false
+    @Published private(set) var meshAnchors = 0
+    @Published private(set) var meshTriangles = 0
+
     @Published private(set) var detections: [Detection] = []
     @Published private(set) var tags: [TagOverlay] = []
     @Published private(set) var imageSize = CGSize(width: 1080, height: 1920)
+    @Published private(set) var videoRotationAngle: CGFloat = 90
     @Published private(set) var stats = FrameStats()
     @Published private(set) var isLoading = false
     @Published private(set) var statusMessage: String?
@@ -107,6 +139,18 @@ final class DetectorViewModel: ObservableObject {
     private let loadQueue = DispatchQueue(label: "yolo.model.load", qos: .userInitiated)
     private var loadGeneration = 0
     private var hasStarted = false
+
+    /// Freezes the current crosshair reading. When the spatial mesh is active the point is
+    /// also anchored in world space, so distances stay valid after the device moves.
+    func pinLiDARPoint() {
+        guard let probe = lidarProbe else { return }
+        let world = meshActive ? mesh.crosshairWorldPosition() : nil
+        pinnedPoints.append(PinnedPoint(probe: probe, worldPosition: world, time: Date()))
+    }
+
+    func clearPinnedPoints() {
+        pinnedPoints.removeAll()
+    }
 
     // Confined to camera.videoQueue.
     private var detector: YOLODetector?
@@ -123,7 +167,31 @@ final class DetectorViewModel: ObservableObject {
     init() {
         selectedModel = models.first
         camera.onFrame = { [weak self] frame in self?.process(frame) }
+        camera.onRotationChange = { [weak self] angle in
+            if let self, self.videoRotationAngle != angle { self.videoRotationAngle = angle }
+        }
+        bindMesh()
     }
+
+    /// Mirrors the ARMeshController's published stats and crosshair probe into this model.
+    private func bindMesh() {
+        mesh.$probe
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] probe in
+                guard let self, self.detectionMode == .lidar else { return }
+                self.lidarProbe = probe
+                self.lidarAvailable = probe != nil
+            }
+            .store(in: &meshCancellables)
+        mesh.$anchorCount
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$meshAnchors)
+        mesh.$triangleCount
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$meshTriangles)
+    }
+
+    private var meshCancellables = Set<AnyCancellable>()
 
     func start() {
         camera.start { [weak self] error in
@@ -133,6 +201,41 @@ final class DetectorViewModel: ObservableObject {
             hasStarted = true
             loadModel()
         }
+    }
+
+    /// Runs the ARKit spatial-mesh scan only in LiDAR mode, and only on devices that
+    /// support it. ARKit and AVCapture cannot share the camera, so the capture session
+    /// stops while the mesh runs and restarts when leaving LiDAR mode.
+    private func updateMeshSession(for mode: DetectionMode) {
+        guard mode.runsLiDAR else {
+            if meshActive {
+                mesh.pause()
+                meshActive = false
+                camera.start { [weak self] error in
+                    if let error { self?.errorMessage = error }
+                }
+            }
+            return
+        }
+        guard ARMeshController.isSupported else {
+            errorMessage = "此设备不支持 ARKit 场景重建，无法显示空间网格；准星测距仍可用"
+            return
+        }
+        if !meshActive {
+            camera.stop { [weak self] in
+                guard let self else { return }
+                self.mesh.run()
+                self.meshActive = true
+            }
+        }
+    }
+
+    /// Clears the spatial mesh scan and the world-anchored pinned points, restarting a fresh scan.
+    func clearSpatialMesh() {
+        pinnedPoints.removeAll()
+        guard meshActive else { return }
+        mesh.stopAndClear()
+        mesh.run()
     }
 
     // MARK: - Model loading
@@ -179,6 +282,7 @@ final class DetectorViewModel: ObservableObject {
         var stats = FrameStats()
         var detections: [Detection] = []
         var tags: [TagOverlay] = []
+        var probe: LiDARProbe?
         var failure: String?
 
         if activeMode.runsYOLO, let detector {
@@ -187,7 +291,13 @@ final class DetectorViewModel: ObservableObject {
                 detections = result.detections
                 if frame.lidarEnabled {
                     let depths = frame.depth.map {
-                        LiDARRanging.distances(in: $0, videoSize: size, intrinsics: frame.intrinsics, detections: detections)
+                        LiDARRanging.distances(
+                            in: $0,
+                            videoSize: size,
+                            rotationAngle: frame.rotationAngle,
+                            intrinsics: frame.intrinsics,
+                            detections: detections
+                        )
                     }
                     for index in detections.indices {
                         let distance = depths?[index] ?? nil
@@ -200,6 +310,17 @@ final class DetectorViewModel: ObservableObject {
             } catch {
                 failure = "推理失败：\(error.localizedDescription)"
             }
+        }
+
+        if activeMode.runsLiDAR, let depth = frame.depth, !ARMeshController.isSupported {
+            // Only probe from AVCapture depth when the ARKit mesh can't own the camera;
+            // otherwise bindMesh() supplies the probe from ARKit scene depth.
+            probe = LiDARRanging.probe(
+                in: depth,
+                videoSize: size,
+                rotationAngle: frame.rotationAngle,
+                intrinsics: frame.intrinsics
+            )
         }
 
         if activeMode.runsAprilTag {
@@ -226,15 +347,23 @@ final class DetectorViewModel: ObservableObject {
         lastFrameTime = now
         stats.fps = smoothedFPS
 
+        let lidarEnabled = frame.lidarEnabled
+        // When the ARKit mesh owns the camera in LiDAR mode, bindMesh() publishes the
+        // probe from scene depth; writing this always-nil AVCapture probe would clobber
+        // it and freeze the crosshair at "— m".
+        let arKitOwnsProbe = activeMode == .lidar && ARMeshController.isSupported
         DispatchQueue.main.async {
             self.detections = detections
             self.tags = tags
+            if !arKitOwnsProbe {
+                self.lidarProbe = probe
+                self.lidarAvailable = lidarEnabled
+            }
             self.imageSize = size
             self.stats = stats
             if let failure { self.errorMessage = failure }
         }
     }
-
     // MARK: - Benchmark
 
     /// Loads the selected model on NPU, GPU and CPU in turn and times raw predictions.

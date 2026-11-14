@@ -1,10 +1,11 @@
 # iOS YOLO26 实时检测
 
-在 iPhone（面向 iPhone 18 Pro / A20 Pro）上用相机实时运行 Ultralytics 最新的 **YOLO26** 目标检测模型，可在 **NPU（Apple Neural Engine）/ GPU / CPU / Auto** 之间即时切换，并内置三种计算单元的跑分对比。IPA 由 GitHub Actions 构建，不签名。
+在 iPhone / iPad（面向 iPhone 18 Pro / A20 Pro 与 iPad Pro）上用相机实时运行 Ultralytics 最新的 **YOLO26** 目标检测模型，可在 **NPU（Apple Neural Engine）/ GPU / CPU / Auto** 之间即时切换，并内置三种计算单元的跑分对比。IPA 由 GitHub Actions 构建，不签名。
 
 ## 功能
 
 - 后置摄像头 1080p@60fps 实时检测，绘制检测框、类别与置信度
+- iPhone / iPad 通用：iPad 支持横竖屏，宽屏下控制面板自动变成右侧边栏；相机角度由 `AVCaptureDevice.RotationCoordinator` 跟随设备，预览、推理帧、LiDAR 采样与 AprilTag 内参始终使用同一旋转角度
 - 计算单元切换（Core ML `MLComputeUnits`）：
   | 选项 | Core ML 设置 | 说明 |
   | --- | --- | --- |
@@ -24,7 +25,7 @@
 工作流：`.github/workflows/build-ipa.yml`，运行在 `macos-26`（Xcode 26）。
 
 1. push 到 `main`/`master`、提 PR 或在 Actions 页面手动运行 **Build unsigned IPA**
-2. 手动运行时可填写要打包的模型（Ultralytics 权重名，如 `yolo26x yolov8x yolo11n`，或仓库里的 `.pt` 路径）和权重精度（FP16 / INT8 / FP32）。默认 8 个模型 FP16 约 275 MB，IPA 也差不多这么大；加上 x 版本会再多约 250 MB，可以改用 INT8 让体积减半
+2. 手动运行时可填写要打包的模型（Ultralytics 权重名，如 `yolo26x yolov8x yolo11n`，或仓库里的 `.pt` 路径）和权重精度（FP16 / INT8 / FP32）。默认 8 个模型 FP16 约 275 MB，IPA 也差不多这么大；加上 x 版本会再多约 250 MB，可以改用 INT8 让体积减半。产物是 iPhone / iPad 通用 IPA
 3. 在运行详情页的 **Artifacts** 下载 `YOLOApp-unsigned-ipa`
 4. 发版：手动运行时在 `release_tag` 填版本号（如 `v1.0.1`），或推送 `v*` 标签，都会创建 GitHub Release 并附上 IPA；发版说明取自 `docs/release-notes/<版本号>.md`（没有则用 GitHub 自动生成的）
 
@@ -32,7 +33,7 @@
 
 ## 安装
 
-IPA 未签名，需要用 Sideloadly、AltStore、SideStore、TrollStore 或自己的证书（如 `zsign` / Xcode）重签后安装。首次打开需要授予相机权限。
+IPA 未签名，需要用 Sideloadly、AltStore、SideStore、TrollStore 或自己的证书（如 `zsign` / Xcode）重签后安装。iPhone 与 iPad 都可以安装，iPad 上支持横竖屏和分屏窗口。首次打开需要授予相机权限。
 
 ## 本地开发（macOS）
 
@@ -67,11 +68,13 @@ xcodegen generate && open YOLOApp.xcodeproj
 YOLOApp/Sources/
   YOLODetector.swift          Core ML 加载、Vision 推理、输出解码 / NMS、跑分
   ComputePlanInspector.swift  MLComputePlan 分析每个算子被分配到 NPU/GPU/CPU
-  CameraManager.swift         AVCaptureSession，竖屏 420f 帧 + 每帧相机内参
+  CameraManager.swift         AVCaptureSession，420f 帧 + 每帧相机内参，随设备旋转
+  CameraPreview.swift         预览图层，与相机连接共用旋转角度
   DetectorViewModel.swift     模型加载/切换、逐帧处理、跑分调度
   ContentView.swift           主界面（预览、HUD、控制面板）
   DetectionOverlay.swift      检测框绘制
   BenchmarkView.swift         跑分结果页
+  LiDARRanging.swift          按检测框采样 LiDAR 深度
   AprilTag/AprilTagBridge.c   AprilTag C 库的精简封装（检测 + 位姿）
   AprilTag/AprilTagTracker.c  位姿二义性消解（板平面 + 时间一致性）+ One Euro 滤波
   AprilTag/AprilTagDetector.swift  左上角坐标系换算、轨迹、投影

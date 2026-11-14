@@ -1,35 +1,86 @@
 import SwiftUI
+import simd
+import UIKit
 
 struct ContentView: View {
     @StateObject private var viewModel = DetectorViewModel()
     @State private var showBenchmark = false
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            CameraPreview(session: viewModel.camera.session)
-                .ignoresSafeArea()
-            DetectionOverlay(detections: viewModel.detections, tags: viewModel.tags, imageSize: viewModel.imageSize)
-                .ignoresSafeArea()
+        GeometryReader { proxy in
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if viewModel.detectionMode == .lidar {
+                    Group {
+                        if viewModel.meshActive {
+                            ARMeshView(controller: viewModel.mesh)
+                        } else {
+                            CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
+                        }
+                    }
+                    .ignoresSafeArea()
+                    LiDAROverlay()
+                        .ignoresSafeArea()
+                } else {
+                    CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
+                        .ignoresSafeArea()
+                    DetectionOverlay(detections: viewModel.detections, tags: viewModel.tags, imageSize: viewModel.imageSize)
+                        .ignoresSafeArea()
+                }
 
-            VStack(spacing: 0) {
-                statsHUD
-                Spacer()
-                controlPanel
-            }
-            .padding(.horizontal, 12)
+                if usesSidePanel(for: proxy.size) {
+                    sidePanelLayout(in: proxy.size)
+                } else {
+                    compactLayout
+                }
 
-            if viewModel.isLoading {
-                ProgressView("正在加载模型…\n首次在 NPU 上加载需要编译，可能需要数秒")
-                    .multilineTextAlignment(.center)
-                    .padding(20)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                if viewModel.isLoading {
+                    ProgressView("正在加载模型…\n首次在 NPU 上加载需要编译，可能需要数秒")
+                        .multilineTextAlignment(.center)
+                        .padding(20)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
             }
         }
         .onAppear { viewModel.start() }
         .sheet(isPresented: $showBenchmark) {
             BenchmarkView(viewModel: viewModel)
         }
+    }
+
+    /// iPads get a side panel so the camera keeps a wide, uncropped view in both orientations.
+    /// Narrow Split View / Stage Manager windows fall back to the compact bottom panel.
+    private func usesSidePanel(for size: CGSize) -> Bool {
+        UIDevice.current.userInterfaceIdiom == .pad && horizontalSizeClass == .regular && size.width >= 700
+    }
+
+    private var compactLayout: some View {
+        VStack(spacing: 0) {
+            statsHUD
+            Spacer()
+            controlPanel
+                .frame(maxWidth: 560)
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private func sidePanelLayout(in size: CGSize) -> some View {
+        let panelWidth = min(380, max(300, size.width * 0.34))
+        return HStack(alignment: .top, spacing: 16) {
+            statsHUD
+                .frame(maxWidth: 420, alignment: .leading)
+                .padding(.top, 8)
+            Spacer(minLength: 0)
+            ScrollView {
+                controlPanel
+                    .frame(maxWidth: .infinity)
+            }
+            .scrollIndicators(.hidden)
+            .frame(width: panelWidth)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(16)
     }
 
     private var statsHUD: some View {
@@ -52,6 +103,15 @@ struct ContentView: View {
                     metric("后处理", String(format: "%.2f ms", viewModel.stats.postprocessMs))
                     metric("目标", "\(viewModel.stats.objectCount)")
                 }
+            }
+            if viewModel.detectionMode == .lidar {
+                Text(viewModel.meshActive
+                     ? String(format: "空间网格运行中 · %d 锚点 · LiDAR 场景重建", viewModel.meshAnchors)
+                     : (viewModel.lidarAvailable || ARMeshController.isSupported
+                        ? "LiDAR 深度有效 · 准星实时测距"
+                        : "未检测到 LiDAR，需要 iPhone/iPad Pro"))
+                    .font(.caption)
+                    .foregroundColor(viewModel.lidarAvailable || viewModel.meshActive ? .mint : .orange)
             }
             if viewModel.detectionMode.runsAprilTag {
                 HStack(spacing: 12) {
@@ -94,37 +154,42 @@ struct ContentView: View {
             if viewModel.detectionMode.runsAprilTag {
                 aprilTagControls
             }
+            if viewModel.detectionMode == .lidar {
+                lidarControls
+            }
 
-            HStack {
-                Menu {
-                    ForEach(ModelGroup.groups(of: viewModel.models)) { group in
-                        Section(group.title) {
-                            ForEach(group.models) { model in
-                                Button {
-                                    viewModel.selectedModel = model
-                                } label: {
-                                    if model == viewModel.selectedModel {
-                                        Label(model.menuTitle, systemImage: "checkmark")
-                                    } else {
-                                        Text(model.menuTitle)
+            if viewModel.detectionMode != .lidar {
+                HStack {
+                    Menu {
+                        ForEach(ModelGroup.groups(of: viewModel.models)) { group in
+                            Section(group.title) {
+                                ForEach(group.models) { model in
+                                    Button {
+                                        viewModel.selectedModel = model
+                                    } label: {
+                                        if model == viewModel.selectedModel {
+                                            Label(model.menuTitle, systemImage: "checkmark")
+                                        } else {
+                                            Text(model.menuTitle)
+                                        }
                                     }
                                 }
                             }
                         }
+                    } label: {
+                        Label(viewModel.selectedModel?.name ?? "选择模型", systemImage: "cube.box")
+                            .frame(maxWidth: .infinity)
                     }
-                } label: {
-                    Label(viewModel.selectedModel?.name ?? "选择模型", systemImage: "cube.box")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
+                    .buttonStyle(.bordered)
 
-                Button {
-                    showBenchmark = true
-                } label: {
-                    Label("跑分对比", systemImage: "speedometer")
-                        .frame(maxWidth: .infinity)
+                    Button {
+                        showBenchmark = true
+                    } label: {
+                        Label("跑分对比", systemImage: "speedometer")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
         }
         .disabled(viewModel.isLoading || viewModel.isBenchmarking)
@@ -182,5 +247,129 @@ struct ContentView: View {
         Text("tag36h11 · 原点=Tag 左上角 · X→右 Y→上 Z→垂直指出 Tag · 坐标为相机系 (cm)")
             .font(.caption2)
             .foregroundColor(.secondary)
+    }
+
+    @ViewBuilder
+    private var lidarControls: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            if let probe = viewModel.lidarProbe {
+                Text(String(format: "%.2f m", probe.range))
+                    .font(.system(size: 34, weight: .semibold, design: .rounded).monospacedDigit())
+                    .foregroundColor(.mint)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(String(format: "X %+.2f   Y %+.2f", probe.x, probe.y))
+                    Text(String(format: "Z %+.2f", probe.z))
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+            } else {
+                Text("— m")
+                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                    .foregroundColor(.secondary)
+                Text(viewModel.lidarAvailable ? "准星处无有效深度" : (viewModel.meshActive ? "等待 ARKit 初始化…" : "设备无 LiDAR"))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+
+        if viewModel.meshActive {
+            MeshStatusControls(mesh: viewModel.mesh)
+        }
+
+        HStack(spacing: 8) {
+            Button {
+                viewModel.pinLiDARPoint()
+            } label: {
+                Label("固定取点", systemImage: "mappin")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.mint)
+            .disabled(viewModel.lidarProbe == nil)
+
+            MeshToggleButton(mesh: viewModel.mesh, enabled: viewModel.meshActive)
+
+            Button(role: .destructive) {
+                viewModel.clearPinnedPoints()
+            } label: {
+                Text("清除点")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(viewModel.pinnedPoints.isEmpty)
+        }
+
+        if viewModel.meshActive {
+            Button(role: .destructive) {
+                viewModel.clearSpatialMesh()
+            } label: {
+                Label("重置扫描", systemImage: "arrow.counterclockwise")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+        }
+
+        if !viewModel.pinnedPoints.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(viewModel.pinnedPoints.enumerated()), id: \.element.id) { index, point in
+                    let probe = point.probe
+                    let spanText: String = {
+                        guard index > 0 else { return "" }
+                        let previous = viewModel.pinnedPoints[index - 1]
+                        if let a = point.worldPosition, let b = previous.worldPosition {
+                            return String(format: "   距上一点 %.2f m（世界）", simd_distance(a, b))
+                        }
+                        return String(format: "   距上一点 %.2f m", probe.distance(to: previous.probe))
+                    }()
+                    Text(String(format: "#%d  %.2f m   X %+.2f  Y %+.2f  Z %+.2f%@", index + 1, probe.range, probe.x, probe.y, probe.z, spanText))
+                        .font(.caption2.monospacedDigit())
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        Text(viewModel.meshActive
+             ? "单位：米 · 空间网格世界锚定，移动视角不消失 · 固定点同样锚定在房间中"
+             : "单位：米 · 坐标原点为镜头中心 · X→右 Y→上 Z→镜头正前方 · 取点坐标相对取点时刻的相机位置，设备移动后不跟随")
+            .font(.caption2)
+            .foregroundColor(.secondary)
+    }
+}
+
+/// Density slider + stats line; observes the mesh controller directly.
+private struct MeshStatusControls: View {
+    @ObservedObject var mesh: ARMeshController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("网格密度").font(.caption)
+                Slider(value: $mesh.meshDensity, in: 10...100, step: 10)
+                Text("\(Int(mesh.meshDensity))%")
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 36)
+            }
+            Text(String(format: "空间网格 · %d 个锚点 · %dk 三角形", mesh.anchorCount, mesh.triangleCount / 1000))
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+/// Grid on/off button; observes the mesh controller directly.
+private struct MeshToggleButton: View {
+    @ObservedObject var mesh: ARMeshController
+    let enabled: Bool
+
+    var body: some View {
+        Button {
+            mesh.meshVisible.toggle()
+        } label: {
+            Text(mesh.meshVisible ? "网格：开" : "网格：关")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!enabled)
     }
 }

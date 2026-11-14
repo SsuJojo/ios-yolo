@@ -1,48 +1,169 @@
 import CoreGraphics
 import CoreVideo
+import simd
+
+/// One crosshair reading. Coordinates are in the camera frame, meters:
+/// X to the right, Y up, Z straight out of the lens (depth along the optical axis).
+struct LiDARProbe: Equatable {
+    var range: Double
+    var x: Double
+    var y: Double
+    var z: Double
+
+    func distance(to other: LiDARProbe) -> Double {
+        let dx = x - other.x, dy = y - other.y, dz = z - other.z
+        return (dx * dx + dy * dy + dz * dz).squareRoot()
+    }
+}
 
 enum LiDARRanging {
-    static func distances(
+    /// Maps a point of the upright video frame (0...1) to the depth map, which stays in the sensor's landscape orientation.
+    private static func sensorCoordinate(u: CGFloat, v: CGFloat, rotation: Int) -> (CGFloat, CGFloat) {
+        switch rotation {
+        case 90: return (v, 1 - u)
+        case 180: return (1 - u, 1 - v)
+        case 270: return (1 - v, u)
+        default: return (u, v)
+        }
+    }
+
+    /// Median depth around `point` (normalized, upright video frame), converted to camera-frame XYZ and line-of-sight range.
+    static func probe(
         in map: CVPixelBuffer,
         videoSize: CGSize,
+        rotationAngle: CGFloat,
         intrinsics: CameraIntrinsics,
-        detections: [Detection]
-    ) -> [Double?] {
+        at point: CGPoint = CGPoint(x: 0.5, y: 0.5),
+        spread: CGSize = CGSize(width: 0.006, height: 0.006)
+    ) -> LiDARProbe? {
         guard CVPixelBufferGetPixelFormatType(map) == kCVPixelFormatType_DepthFloat16,
-              CVPixelBufferLockBaseAddress(map, .readOnly) == kCVReturnSuccess else {
-            return Array(repeating: nil, count: detections.count)
-        }
+              CVPixelBufferLockBaseAddress(map, .readOnly) == kCVReturnSuccess else { return nil }
         defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
-        guard let bytes = CVPixelBufferGetBaseAddress(map) else {
-            return Array(repeating: nil, count: detections.count)
-        }
+        guard let bytes = CVPixelBufferGetBaseAddress(map) else { return nil }
         let width = CVPixelBufferGetWidth(map)
         let height = CVPixelBufferGetHeight(map)
         let stride = CVPixelBufferGetBytesPerRow(map) / MemoryLayout<UInt16>.stride
         let pixels = bytes.assumingMemoryBound(to: UInt16.self)
-        // Video buffers are rotated clockwise for portrait. Depth may still be in sensor orientation.
-        let rotate = videoSize.height > videoSize.width && width > height
+        let rotation = Int(rotationAngle.rounded()) % 360
 
-        return detections.map { detection in
+        var samples: [(z: Double, rx: Double, ry: Double)] = []
+        for row in -2...2 {
+            for column in -2...2 {
+                let u = point.x + CGFloat(column) * spread.width
+                let v = point.y + CGFloat(row) * spread.height
+                guard (0...1).contains(u), (0...1).contains(v) else { continue }
+                let (sensorU, sensorV) = sensorCoordinate(u: u, v: v, rotation: rotation)
+                let px = min(width - 1, max(0, Int(sensorU * CGFloat(width))))
+                let py = min(height - 1, max(0, Int(sensorV * CGFloat(height))))
+                let z = Double(Float16(bitPattern: pixels[py * stride + px]))
+                guard z.isFinite, z > 0 else { continue }
+                samples.append((
+                    z,
+                    (Double(u * videoSize.width) - intrinsics.cx) / intrinsics.fx,
+                    (Double(v * videoSize.height) - intrinsics.cy) / intrinsics.fy
+                ))
+            }
+        }
+        guard samples.count >= 9 else { return nil }
+        // Break up the chain to help the Swift type-checker.
+        typealias Ranked = (sample: (z: Double, rx: Double, ry: Double), range: Double)
+        var ranged: [Ranked] = samples.map { s in
+            let los: Double = s.z * (1.0 + s.rx * s.rx + s.ry * s.ry).squareRoot()
+            return (sample: s, range: los)
+        }
+        ranged.sort { $0.range < $1.range }
+        let m = ranged[ranged.count / 2]
+        return LiDARProbe(
+            range: m.range,
+            x: m.sample.rx * m.sample.z,
+            y: -m.sample.ry * m.sample.z,
+            z: m.sample.z
+        )
+    }
+
+    static func distances(
+        in map: CVPixelBuffer,
+        videoSize: CGSize,
+        rotationAngle: CGFloat,
+        intrinsics: CameraIntrinsics,
+        detections: [Detection]
+    ) -> [Double?] {
+        detections.map { detection in
             let box = detection.rect.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
             guard !box.isEmpty else { return nil }
-            var samples: [Double] = []
-            for row in -2...2 {
-                for column in -2...2 {
-                    let u = box.midX + CGFloat(column) * box.width * 0.075
-                    let v = box.midY + CGFloat(row) * box.height * 0.075
-                    let x = min(width - 1, Int((rotate ? v : u) * CGFloat(width)))
-                    let y = min(height - 1, Int((rotate ? 1 - u : v) * CGFloat(height)))
-                    let z = Double(Float16(bitPattern: pixels[y * stride + x]))
-                    guard z.isFinite, z > 0 else { continue }
-                    let rx = (Double(u * videoSize.width) - intrinsics.cx) / intrinsics.fx
-                    let ry = (Double(v * videoSize.height) - intrinsics.cy) / intrinsics.fy
-                    samples.append(z * (1 + rx * rx + ry * ry).squareRoot())
-                }
-            }
-            guard samples.count >= 9 else { return nil }
-            samples.sort()
-            return samples[samples.count / 2]
+            // The sample grid scales with the box, as before: 5x5 points spaced 7.5% of the box size.
+            let spread = CGSize(width: box.width * 0.075, height: box.height * 0.075)
+            return probe(
+                in: map,
+                videoSize: videoSize,
+                rotationAngle: rotationAngle,
+                intrinsics: intrinsics,
+                at: CGPoint(x: box.midX, y: box.midY),
+                spread: spread
+            )?.range
         }
+    }
+
+    // MARK: - ARKit scene depth (spatial-mesh mode)
+
+    /// Median depth around the center of ARKit's depth map, reported in ARKit camera
+    /// coordinates (X right, Y up, Z forward) so it matches the existing LiDARProbe axes.
+    /// `imageSize` is the captured-image resolution the intrinsics are expressed in.
+    static func probeAR(
+        depthMap: CVPixelBuffer,
+        imageSize: CGSize,
+        intrinsics: simd_float3x3,
+        upright: CGAffineTransform
+    ) -> LiDARProbe? {
+        guard CVPixelBufferGetPixelFormatType(depthMap) == kCVPixelFormatType_DepthFloat32,
+              CVPixelBufferLockBaseAddress(depthMap, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+        guard let bytes = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        let stride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float>.stride
+        let pixels = bytes.assumingMemoryBound(to: Float.self)
+        let fx = Double(intrinsics.columns.0.x), fy = Double(intrinsics.columns.1.y)
+        let cx = Double(intrinsics.columns.2.x), cy = Double(intrinsics.columns.2.y)
+        let imageWidth = Double(imageSize.width), imageHeight = Double(imageSize.height)
+
+        // ARKit's depth map is in sensor landscape orientation; `upright` maps the upright
+        // portrait image to that buffer. Sample the crosshair in the upright portrait frame,
+        // then map to sensor coordinates for lookup and to image pixels for the ray.
+        let inv = upright.inverted()
+        var samples: [(z: Double, rx: Double, ry: Double)] = []
+        samples.reserveCapacity(25)
+        for row in -2...2 {
+            for column in -2...2 {
+                let u = 0.5 + CGFloat(column) * 0.006
+                let v = 0.5 + CGFloat(row) * 0.006
+                let sensor = CGPoint(x: u, y: v).applying(inv)
+                guard (0...1).contains(sensor.x), (0...1).contains(sensor.y) else { continue }
+                let px = min(width - 1, max(0, Int(sensor.x * CGFloat(width))))
+                let py = min(height - 1, max(0, Int(sensor.y * CGFloat(height))))
+                let z = Double(pixels[py * stride + px])
+                guard z.isFinite, z > 0 else { continue }
+                // Back-project through the pinhole in captured-image pixel units.
+                samples.append((
+                    z,
+                    (Double(sensor.x) * imageWidth - cx) / fx,
+                    (Double(sensor.y) * imageHeight - cy) / fy
+                ))
+            }
+        }
+        guard samples.count >= 9 else { return nil }
+        typealias Ranked = (sample: (z: Double, rx: Double, ry: Double), range: Double)
+        var ranged: [Ranked] = samples.map { s in
+            let los: Double = s.z * (1.0 + s.rx * s.rx + s.ry * s.ry).squareRoot()
+            return (sample: s, range: los)
+        }
+        ranged.sort { $0.range < $1.range }
+        let m = ranged[ranged.count / 2]
+        return LiDARProbe(
+            range: m.range,
+            x: m.sample.rx * m.sample.z,
+            y: -m.sample.ry * m.sample.z,
+            z: m.sample.z
+        )
     }
 }
