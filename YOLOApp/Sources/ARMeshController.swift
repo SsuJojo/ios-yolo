@@ -14,6 +14,19 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
     let session = ARSession()
     let scene = SCNScene()
 
+    /// Reusable render view. Constructing an ARSCNView rebuilds the SceneKit/Metal
+    /// pipeline, which stalled the UI for many seconds on every LiDAR-tab entry; keep
+    /// exactly one instance and hand the same view back to SwiftUI on each visit.
+    lazy var arView: ARSCNView = {
+        let view = ARSCNView(frame: .zero)
+        view.session = session
+        view.delegate = self
+        view.scene = scene
+        view.automaticallyUpdatesLighting = false
+        view.antialiasingMode = .none
+        return view
+    }()
+
     /// Toggles the white wireframe without stopping the scan.
     @Published var meshVisible = true {
         didSet { guard meshVisible != oldValue else { return }; applyVisibility() }
@@ -43,7 +56,12 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
     /// the anchor's Metal buffers, so raw bytes are copied at callback time (Apple sample pattern).
     private var snapshots: [UUID: MeshSnapshot] = [:]
     private var meshNodes: [UUID: SCNNode] = [:]
-    private var frameCounter = 0
+    /// ~20 Hz crosshair probe timer. Polls `session.currentFrame` directly instead of
+    /// relying on per-frame delegate callbacks: ARSCNView does not guarantee that
+    /// ARSessionDelegate frame updates are forwarded to its `delegate`, and the old
+    /// callback chain silently starved the crosshair reading ("— m").
+    private var probeTimer: Timer?
+    private var lastPolledTimestamp: TimeInterval = -1
 
     /// CPU-owned copy of one ARMeshAnchor's geometry.
     struct MeshSnapshot {
@@ -85,10 +103,16 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
         configuration.frameSemantics = [.sceneDepth]
         arAvailable = true
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        startProbePolling()
     }
 
     func pause() {
         session.pause()
+        stopProbePolling()
+        lock.lock()
+        lastSnapshot = nil
+        lock.unlock()
+        DispatchQueue.main.async { self.probe = nil }
     }
 
     func stopAndClear() {
@@ -108,13 +132,31 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
         }
     }
 
-    // MARK: - ARSessionDelegate
+    // MARK: - Crosshair probe (polled)
 
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        guard let depth = frame.sceneDepth else { return }
-        frameCounter += 1
-        // Probe at ~20 Hz; publishing every AR frame is wasteful.
-        guard frameCounter % 3 == 0 else { return }
+    private func startProbePolling() {
+        DispatchQueue.main.async {
+            guard self.probeTimer == nil else { return }
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+                self?.pollProbe()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.probeTimer = timer
+        }
+    }
+
+    private func stopProbePolling() {
+        DispatchQueue.main.async {
+            self.probeTimer?.invalidate()
+            self.probeTimer = nil
+        }
+    }
+
+    private func pollProbe() {
+        guard let frame = session.currentFrame, let depth = frame.sceneDepth else { return }
+        // The timer (~20 Hz) is slower than the camera; skip frames already measured.
+        guard frame.timestamp != lastPolledTimestamp else { return }
+        lastPolledTimestamp = frame.timestamp
         let upright = frame.displayTransform(for: .portrait, viewportSize: CGSize(width: 1, height: 1))
         let result = LiDARRanging.probeAR(
             depthMap: depth.depthMap,
@@ -130,7 +172,8 @@ final class ARMeshController: NSObject, ObservableObject, ARSessionDelegate, ARS
         lock.lock()
         lastSnapshot = snapshot
         lock.unlock()
-        DispatchQueue.main.async { self.probe = result }
+        // The timer fires on the main run loop, so publish directly.
+        probe = result
     }
 
     /// Probe + camera pose captured from one ARFrame.
@@ -313,13 +356,10 @@ struct ARMeshView: UIViewRepresentable {
     let controller: ARMeshController
 
     func makeUIView(context: Context) -> ARSCNView {
-        let view = ARSCNView(frame: .zero)
-        view.session = controller.session
-        view.delegate = controller
-        view.scene = controller.scene
-        view.automaticallyUpdatesLighting = false
-        view.antialiasingMode = .none
-        return view
+        // Hand back the controller's single prebuilt ARSCNView. Creating a fresh view
+        // rebuilds the SceneKit/Metal pipeline (plus first-frame shader compilation) on
+        // the main thread, which froze the UI for many seconds on every tab entry.
+        return controller.arView
     }
 
     func updateUIView(_ uiView: ARSCNView, context: Context) {}

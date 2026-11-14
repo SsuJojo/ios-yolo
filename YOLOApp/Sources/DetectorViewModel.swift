@@ -348,11 +348,17 @@ final class DetectorViewModel: ObservableObject {
         stats.fps = smoothedFPS
 
         let lidarEnabled = frame.lidarEnabled
+        // When the ARKit mesh owns the camera in LiDAR mode, bindMesh() publishes the
+        // probe from scene depth; writing this always-nil AVCapture probe would clobber
+        // it and freeze the crosshair at "— m".
+        let arKitOwnsProbe = activeMode == .lidar && ARMeshController.isSupported
         DispatchQueue.main.async {
             self.detections = detections
             self.tags = tags
-            self.lidarProbe = probe
-            self.lidarAvailable = lidarEnabled
+            if !arKitOwnsProbe {
+                self.lidarProbe = probe
+                self.lidarAvailable = lidarEnabled
+            }
             self.imageSize = size
             self.stats = stats
             if let failure { self.errorMessage = failure }
