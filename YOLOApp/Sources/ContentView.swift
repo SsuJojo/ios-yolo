@@ -1,35 +1,72 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @StateObject private var viewModel = DetectorViewModel()
     @State private var showBenchmark = false
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            CameraPreview(session: viewModel.camera.session)
-                .ignoresSafeArea()
-            DetectionOverlay(detections: viewModel.detections, tags: viewModel.tags, imageSize: viewModel.imageSize)
-                .ignoresSafeArea()
+        GeometryReader { proxy in
+            ZStack {
+                Color.black.ignoresSafeArea()
+                CameraPreview(session: viewModel.camera.session, rotationAngle: viewModel.videoRotationAngle)
+                    .ignoresSafeArea()
+                DetectionOverlay(detections: viewModel.detections, tags: viewModel.tags, imageSize: viewModel.imageSize)
+                    .ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                statsHUD
-                Spacer()
-                controlPanel
-            }
-            .padding(.horizontal, 12)
+                if usesSidePanel(for: proxy.size) {
+                    sidePanelLayout(in: proxy.size)
+                } else {
+                    compactLayout
+                }
 
-            if viewModel.isLoading {
-                ProgressView("正在加载模型…\n首次在 NPU 上加载需要编译，可能需要数秒")
-                    .multilineTextAlignment(.center)
-                    .padding(20)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                if viewModel.isLoading {
+                    ProgressView("正在加载模型…\n首次在 NPU 上加载需要编译，可能需要数秒")
+                        .multilineTextAlignment(.center)
+                        .padding(20)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
             }
         }
         .onAppear { viewModel.start() }
         .sheet(isPresented: $showBenchmark) {
             BenchmarkView(viewModel: viewModel)
         }
+    }
+
+    /// iPads get a side panel so the camera keeps a wide, uncropped view in both orientations.
+    /// Narrow Split View / Stage Manager windows fall back to the compact bottom panel.
+    private func usesSidePanel(for size: CGSize) -> Bool {
+        UIDevice.current.userInterfaceIdiom == .pad && horizontalSizeClass == .regular && size.width >= 700
+    }
+
+    private var compactLayout: some View {
+        VStack(spacing: 0) {
+            statsHUD
+            Spacer()
+            controlPanel
+                .frame(maxWidth: 560)
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private func sidePanelLayout(in size: CGSize) -> some View {
+        let panelWidth = min(380, max(300, size.width * 0.34))
+        return HStack(alignment: .top, spacing: 16) {
+            statsHUD
+                .frame(maxWidth: 420, alignment: .leading)
+                .padding(.top, 8)
+            Spacer(minLength: 0)
+            ScrollView {
+                controlPanel
+                    .frame(maxWidth: .infinity)
+            }
+            .scrollIndicators(.hidden)
+            .frame(width: panelWidth)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(16)
     }
 
     private var statsHUD: some View {

@@ -5,6 +5,7 @@ enum LiDARRanging {
     static func distances(
         in map: CVPixelBuffer,
         videoSize: CGSize,
+        rotationAngle: CGFloat,
         intrinsics: CameraIntrinsics,
         detections: [Detection]
     ) -> [Double?] {
@@ -20,8 +21,8 @@ enum LiDARRanging {
         let height = CVPixelBufferGetHeight(map)
         let stride = CVPixelBufferGetBytesPerRow(map) / MemoryLayout<UInt16>.stride
         let pixels = bytes.assumingMemoryBound(to: UInt16.self)
-        // Video buffers are rotated clockwise for portrait. Depth may still be in sensor orientation.
-        let rotate = videoSize.height > videoSize.width && width > height
+        // Video buffers are rotated clockwise; depth stays in the sensor's landscape orientation.
+        let rotation = Int(rotationAngle.rounded()) % 360
 
         return detections.map { detection in
             let box = detection.rect.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
@@ -31,8 +32,20 @@ enum LiDARRanging {
                 for column in -2...2 {
                     let u = box.midX + CGFloat(column) * box.width * 0.075
                     let v = box.midY + CGFloat(row) * box.height * 0.075
-                    let x = min(width - 1, Int((rotate ? v : u) * CGFloat(width)))
-                    let y = min(height - 1, Int((rotate ? 1 - u : v) * CGFloat(height)))
+                    let sensorU: CGFloat
+                    let sensorV: CGFloat
+                    switch rotation {
+                    case 90:
+                        (sensorU, sensorV) = (v, 1 - u)
+                    case 180:
+                        (sensorU, sensorV) = (1 - u, 1 - v)
+                    case 270:
+                        (sensorU, sensorV) = (1 - v, u)
+                    default:
+                        (sensorU, sensorV) = (u, v)
+                    }
+                    let x = min(width - 1, max(0, Int(sensorU * CGFloat(width))))
+                    let y = min(height - 1, max(0, Int(sensorV * CGFloat(height))))
                     let z = Double(Float16(bitPattern: pixels[y * stride + x]))
                     guard z.isFinite, z > 0 else { continue }
                     let rx = (Double(u * videoSize.width) - intrinsics.cx) / intrinsics.fx
