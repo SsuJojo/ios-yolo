@@ -66,9 +66,10 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
 
-    func stop() {
+    func stop(completion: (() -> Void)? = nil) {
         sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
+            if let completion { DispatchQueue.main.async(execute: completion) }
         }
     }
 
